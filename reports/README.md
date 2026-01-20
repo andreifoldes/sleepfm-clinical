@@ -6,18 +6,20 @@ This directory contains Quarto reports for analyzing PSG data and predicting dis
 
 ### 1. Dementia Risk Prediction (`dementia_risk_prediction.qmd`)
 
-A comprehensive report demonstrating how to:
-- Download freely accessible PSG data from PhysioNet/NSRR
-- Preprocess EDF files to HDF5 format
-- Generate embeddings using the pre-trained SleepFM base model
-- Predict dementia risk using the fine-tuned disease prediction model
-- Visualize and interpret results
+A comprehensive Quarto report demonstrating how to predict dementia risk from PSG data using the SleepFM foundation model.
 
-**Key Features:**
-- Uses freely available data from Sleep Heart Health Study (SHHS)
-- Complete end-to-end pipeline
-- Clinical interpretation of hazard ratios
-- Reproducible analysis with embedded code
+**What it demonstrates:**
+- Using the pre-trained SleepFM base model to generate embeddings from PSG data
+- Predicting dementia risk using the fine-tuned disease prediction model
+- Interpreting hazard ratios and clinical implications
+- Complete end-to-end pipeline from EDF files to risk predictions
+
+**Data:**
+- Works with demo PSG data included in `notebooks/demo_data/`
+- Can be adapted for external datasets from NSRR/PhysioNet (SHHS, MESA, etc.)
+- Includes synthetic demographics and disease labels for demonstration
+
+**Status:** ⚠️ In development - requires dependency installation and testing
 
 ## Prerequisites
 
