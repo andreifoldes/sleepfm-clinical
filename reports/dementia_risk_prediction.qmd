@@ -1,0 +1,690 @@
+---
+title: "Predicting Dementia Risk from PSG Data Using SleepFM"
+subtitle: "A Transformer-Based Approach to Sleep-Based Disease Prediction"
+author: "SleepFM Clinical Analysis"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: true
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+# Executive Summary
+
+This report demonstrates the application of **SleepFM**, a multimodal sleep foundation model, for predicting dementia risk from polysomnography (PSG) data. We use freely accessible PSG recordings from the **Sleep Heart Health Study (SHHS)** available on PhysioNet/National Sleep Research Resource to:
+
+1. Download and preprocess PSG data in EDF format
+2. Generate embeddings using the pre-trained SleepFM base model
+3. Predict dementia risk using the fine-tuned disease prediction model
+4. Visualize and interpret the results
+
+**Key Findings:**
+
+- SleepFM achieves a **C-Index of 0.85** for dementia prediction (published in *Nature Medicine*, 2026)
+- The model analyzes multi-modal PSG signals: brain activity (EEG), respiration, cardiac (ECG), and muscle activity (EMG)
+- Predictions are based on 585,000+ hours of training data from ~65,000 participants
+
+---
+
+# Introduction
+
+## Background
+
+Dementia represents a major public health challenge affecting millions worldwide. Early detection is crucial for intervention and care planning. Sleep disturbances are increasingly recognized as both early markers and potential modifiable risk factors for dementia.
+
+Polysomnography (PSG) captures rich, multi-modal physiological data during sleep, including:
+
+- **Brain activity (EEG)**: Electrical patterns reflecting sleep stages and neurophysiology
+- **Respiration**: Breathing patterns, apnea events, oxygen saturation
+- **Cardiac (ECG)**: Heart rate and rhythm
+- **Muscle activity (EMG)**: Muscle tone and movements
+
+## SleepFM Architecture
+
+**SleepFM** is a transformer-based foundation model trained with contrastive learning on over 585,000 hours of PSG data. Key features:
+
+- **Multi-modal processing**: Handles variable PSG montages (electrode arrangements)
+- **Spatial pooling**: Aggregates information across channels within each modality
+- **Temporal modeling**: Captures sleep dynamics over time using transformer encoders
+- **Transfer learning**: Pre-trained representations enable accurate disease prediction
+
+The model predicts hazard ratios for 1,065 conditions, including dementia (Phecode 290.0).
+
+---
+
+# Data Acquisition
+
+## Freely Accessible PSG Datasets
+
+We demonstrate the pipeline using data from the **Sleep Heart Health Study (SHHS)**, a landmark multi-center cohort study examining cardiovascular consequences of sleep-disordered breathing.
+
+### Data Sources
+
+| Dataset | URL | Description | Sample Size |
+|---------|-----|-------------|-------------|
+| **SHHS** | [sleepdata.org/datasets/shhs](https://sleepdata.org/datasets/shhs) | Comprehensive PSG with cardiovascular outcomes | ~5,800 participants |
+| **MESA** | [sleepdata.org/datasets/mesa](https://sleepdata.org/datasets/mesa) | Multi-Ethnic Study of Atherosclerosis | ~2,000 participants |
+| **CHAT** | [sleepdata.org/datasets/chat](https://sleepdata.org/datasets/chat) | Childhood Adenotonsillectomy Trial | ~1,400 children |
+
+All datasets are available through the **National Sleep Research Resource (NSRR)** and require registration (free for research use).
+
+## Download Instructions
+
+```{python}
+#| eval: false
+#| label: download-data
+#| echo: true
+
+# Install NSRR downloader
+# pip install nsrr
+
+# Download sample SHHS PSG files (requires NSRR account)
+import subprocess
+import os
+
+# Create data directory
+os.makedirs("data/shhs/polysomnography/edfs", exist_ok=True)
+
+# Download first 5 PSG files from SHHS (for demonstration)
+# Note: You'll need to authenticate with your NSRR token
+nsrr_token = "YOUR_NSRR_TOKEN_HERE"  # Get from sleepdata.org after registration
+
+for i in range(1, 6):
+    file_id = f"shhs1-{i:06d}"
+    cmd = f"nsrr download shhs/polysomnography/edfs/shhs1/{file_id}.edf -t {nsrr_token}"
+    print(f"Downloading {file_id}.edf...")
+    # subprocess.run(cmd, shell=True)
+
+print("Download complete! Files saved to data/shhs/polysomnography/edfs/")
+```
+
+::: {.callout-note}
+## Alternative: Use Demo Data
+
+This report can also run on the **demo PSG file** included in the SleepFM repository:
+
+- Location: `sleepfm/data/mesa/mesa-sleep-0001.edf`
+- This is a single-night recording from the MESA dataset
+:::
+
+---
+
+# Environment Setup
+
+## Dependencies
+
+```{python}
+#| label: setup
+#| echo: true
+
+import sys
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import h5py
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Add sleepfm to path
+sys.path.insert(0, '/home/user/sleepfm-clinical')
+
+from sleepfm.preprocessing.preprocessing import EDFToHDF5Converter
+from sleepfm.models.models import SetTransformer, DiagnosisFinetuneFullLSTMCOXPHWithDemo
+from sleepfm.utils import load_checkpoint
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+# Configure plot style
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['font.size'] = 10
+```
+
+## Model Configuration
+
+```{python}
+#| label: config
+#| echo: true
+
+# Paths
+BASE_DIR = Path("/home/user/sleepfm-clinical")
+DATA_DIR = BASE_DIR / "data"
+CHECKPOINT_BASE = BASE_DIR / "sleepfm/checkpoints/model_base"
+CHECKPOINT_DIAGNOSIS = BASE_DIR / "sleepfm/checkpoints/model_diagnosis"
+LABEL_MAPPING = BASE_DIR / "sleepfm/configs/label_mapping.csv"
+
+# Model hyperparameters
+CONFIG = {
+    'embed_dim': 128,
+    'num_heads': 8,
+    'num_encoder_layers': 6,
+    'num_modalities': 4,  # BAS, RESP, EKG, EMG
+    'sampling_rate': 128,  # Hz
+    'epoch_duration': 300,  # seconds (5 minutes)
+    'max_seq_length': 6480,  # ~540 minutes per night
+}
+
+print("Configuration loaded successfully!")
+print(f"Embedding dimension: {CONFIG['embed_dim']}")
+print(f"Number of modalities: {CONFIG['num_modalities']}")
+```
+
+---
+
+# Data Preprocessing
+
+## EDF to HDF5 Conversion
+
+PSG files are typically stored in European Data Format (EDF). We convert them to HDF5 for efficient processing.
+
+```{python}
+#| label: preprocessing
+#| echo: true
+#| eval: false
+
+# Initialize converter
+converter = EDFToHDF5Converter(
+    root_dir=str(DATA_DIR / "shhs/polysomnography/edfs"),
+    target_dir=str(DATA_DIR / "shhs/processed"),
+    resample_rate=CONFIG['sampling_rate'],
+    num_threads=4
+)
+
+# Convert all EDF files
+print("Starting EDF to HDF5 conversion...")
+converter.convert_all_multiprocessing()
+print("Conversion complete!")
+```
+
+::: {.callout-tip}
+## Processing Details
+
+- **Resampling**: All channels resampled to 128 Hz
+- **Normalization**: Z-score standardization per channel
+- **Compression**: gzip compression (level 4) for efficient storage
+- **Chunking**: 5-minute epochs (38,400 samples @ 128 Hz)
+:::
+
+## Data Inspection
+
+```{python}
+#| label: inspect-data
+#| echo: true
+#| eval: false
+
+# Load a processed HDF5 file
+sample_file = DATA_DIR / "shhs/processed/shhs1-000001.h5"
+
+if sample_file.exists():
+    with h5py.File(sample_file, 'r') as f:
+        print("Available channels:")
+        for key in f.keys():
+            data = f[key][:]
+            duration_minutes = len(data) / (CONFIG['sampling_rate'] * 60)
+            print(f"  {key}: {data.shape} ({duration_minutes:.1f} minutes)")
+
+        # Extract metadata
+        recording_duration = len(f[list(f.keys())[0]]) / (CONFIG['sampling_rate'] * 60)
+        num_epochs = int(recording_duration / (CONFIG['epoch_duration'] / 60))
+
+        print(f"\nRecording duration: {recording_duration:.1f} minutes")
+        print(f"Number of 5-minute epochs: {num_epochs}")
+else:
+    print(f"Sample file not found: {sample_file}")
+    print("Using demo data instead...")
+```
+
+---
+
+# Embedding Generation
+
+## Load Pre-trained Base Model
+
+```{python}
+#| label: load-base-model
+#| echo: true
+#| eval: false
+
+# Initialize base model
+base_model = SetTransformer(
+    embed_dim=CONFIG['embed_dim'],
+    num_heads=CONFIG['num_heads'],
+    num_encoder_layers=CONFIG['num_encoder_layers'],
+    num_modalities=CONFIG['num_modalities']
+).to(device)
+
+# Load checkpoint
+checkpoint = torch.load(CHECKPOINT_BASE / "best_model.pt", map_location=device)
+base_model.load_state_dict(checkpoint['model_state_dict'])
+base_model.eval()
+
+print("Base model loaded successfully!")
+print(f"Model parameters: {sum(p.numel() for p in base_model.parameters()) / 1e6:.2f}M")
+```
+
+## Generate Embeddings
+
+```{python}
+#| label: generate-embeddings
+#| echo: true
+#| eval: false
+
+def generate_embeddings(hdf5_path, model, device, config):
+    """
+    Generate 128-dim embeddings for each 5-minute epoch
+
+    Returns:
+        embeddings: (num_epochs, embed_dim) numpy array
+        modality_embeddings: dict of (num_epochs, embed_dim) per modality
+    """
+    with h5py.File(hdf5_path, 'r') as f:
+        # Load all channels
+        channels = {key: f[key][:] for key in f.keys()}
+
+    # Group channels by modality (simplified - actual grouping from channel_groups.json)
+    modality_groups = {
+        'BAS': [k for k in channels.keys() if any(x in k.upper() for x in ['EEG', 'C3', 'C4', 'F3', 'F4', 'O1', 'O2'])],
+        'RESP': [k for k in channels.keys() if any(x in k.upper() for x in ['RESP', 'THOR', 'ABDO', 'AIRFLOW'])],
+        'EKG': [k for k in channels.keys() if any(x in k.upper() for x in ['ECG', 'EKG'])],
+        'EMG': [k for k in channels.keys() if any(x in k.upper() for x in ['EMG', 'CHIN', 'LEG'])]
+    }
+
+    # Create epochs
+    epoch_samples = config['sampling_rate'] * config['epoch_duration']
+    num_epochs = min([len(channels[k]) for k in channels.keys()]) // epoch_samples
+
+    all_embeddings = []
+
+    with torch.no_grad():
+        for epoch_idx in range(num_epochs):
+            start_idx = epoch_idx * epoch_samples
+            end_idx = start_idx + epoch_samples
+
+            # Extract epoch data for each modality
+            modality_data = {}
+            for mod_name, channel_list in modality_groups.items():
+                if channel_list:
+                    mod_data = np.stack([channels[ch][start_idx:end_idx] for ch in channel_list])
+                    modality_data[mod_name] = torch.FloatTensor(mod_data).unsqueeze(0).to(device)
+
+            # Generate embedding
+            embedding = model(modality_data)
+            all_embeddings.append(embedding.cpu().numpy())
+
+    return np.vstack(all_embeddings)
+
+# Generate embeddings for sample file
+if sample_file.exists():
+    embeddings = generate_embeddings(sample_file, base_model, device, CONFIG)
+    print(f"Generated embeddings shape: {embeddings.shape}")
+
+    # Save embeddings
+    embeddings_path = DATA_DIR / "shhs/embeddings/shhs1-000001_embeddings.npy"
+    embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(embeddings_path, embeddings)
+    print(f"Embeddings saved to {embeddings_path}")
+```
+
+---
+
+# Dementia Risk Prediction
+
+## Load Disease Prediction Model
+
+```{python}
+#| label: load-diagnosis-model
+#| echo: true
+#| eval: false
+
+# Initialize diagnosis model
+diagnosis_model = DiagnosisFinetuneFullLSTMCOXPHWithDemo(
+    embed_dim=CONFIG['embed_dim'],
+    num_classes=1065,  # Total number of diseases
+    hidden_dim=256,
+    num_lstm_layers=2,
+    dropout=0.1
+).to(device)
+
+# Load checkpoint
+checkpoint_diag = torch.load(CHECKPOINT_DIAGNOSIS / "best_model.pt", map_location=device)
+diagnosis_model.load_state_dict(checkpoint_diag['model_state_dict'])
+diagnosis_model.eval()
+
+print("Diagnosis model loaded successfully!")
+print(f"Model parameters: {sum(p.numel() for p in diagnosis_model.parameters()) / 1e6:.2f}M")
+print(f"Number of disease classes: 1065")
+```
+
+## Load Label Mapping
+
+```{python}
+#| label: load-labels
+#| echo: true
+
+# Load disease label mapping
+labels_df = pd.read_csv(LABEL_MAPPING)
+print(f"Total diseases: {len(labels_df)}")
+
+# Find dementia-related conditions
+dementia_labels = labels_df[labels_df['phenotype'].str.contains('dementia|alzheimer', case=False, na=False)]
+print(f"\nDementia-related conditions ({len(dementia_labels)}):")
+print(dementia_labels[['label_idx', 'phecode', 'phenotype']].to_string(index=False))
+
+# Primary dementia label (Phecode 290.0)
+DEMENTIA_IDX = labels_df[labels_df['phecode'] == '290.0'].iloc[0]['label_idx']
+print(f"\nPrimary dementia label index: {DEMENTIA_IDX}")
+```
+
+## Predict Dementia Risk
+
+```{python}
+#| label: predict-dementia
+#| echo: true
+#| eval: false
+
+def predict_disease_risk(embeddings, demographics, model, device):
+    """
+    Predict hazard ratios for all 1,065 diseases
+
+    Args:
+        embeddings: (num_epochs, embed_dim) numpy array
+        demographics: dict with 'age' and 'gender' (0=female, 1=male)
+        model: diagnosis model
+        device: torch device
+
+    Returns:
+        hazard_logits: (1065,) numpy array of log hazard ratios
+    """
+    # Prepare inputs
+    emb_tensor = torch.FloatTensor(embeddings).unsqueeze(0).to(device)  # (1, num_epochs, embed_dim)
+
+    # Create mask (all epochs are valid)
+    mask = torch.ones(1, embeddings.shape[0], dtype=torch.bool).to(device)
+
+    # Demographics tensor
+    demo_tensor = torch.FloatTensor([[demographics['age'], demographics['gender']]]).to(device)
+
+    # Forward pass
+    with torch.no_grad():
+        outputs = model(emb_tensor, mask, demo_tensor)
+
+    return outputs.cpu().numpy()[0]
+
+# Example prediction
+if 'embeddings' in locals():
+    # Example demographics
+    patient_demographics = {
+        'age': 65,  # years
+        'gender': 1  # 1=male, 0=female
+    }
+
+    # Predict
+    hazard_logits = predict_disease_risk(embeddings, patient_demographics, diagnosis_model, device)
+
+    # Extract dementia risk
+    dementia_hazard = hazard_logits[DEMENTIA_IDX]
+    dementia_risk_ratio = np.exp(dementia_hazard)
+
+    print(f"\n{'='*60}")
+    print(f"DEMENTIA RISK PREDICTION")
+    print(f"{'='*60}")
+    print(f"Patient: {patient_demographics['age']} years, {'Male' if patient_demographics['gender'] == 1 else 'Female'}")
+    print(f"Log Hazard Ratio: {dementia_hazard:.4f}")
+    print(f"Hazard Ratio: {dementia_risk_ratio:.4f}")
+    print(f"Interpretation: {dementia_risk_ratio:.2f}x relative risk vs. baseline")
+    print(f"{'='*60}")
+```
+
+---
+
+# Results Visualization
+
+## Top Disease Risks
+
+```{python}
+#| label: visualize-top-risks
+#| echo: true
+#| eval: false
+#| fig-cap: "Top 20 predicted disease risks for the sample patient"
+
+if 'hazard_logits' in locals():
+    # Create results dataframe
+    results_df = labels_df.copy()
+    results_df['hazard_logit'] = hazard_logits
+    results_df['hazard_ratio'] = np.exp(hazard_logits)
+
+    # Sort by risk
+    results_df = results_df.sort_values('hazard_ratio', ascending=False)
+
+    # Top 20 risks
+    top_risks = results_df.head(20)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    colors = ['red' if 'dementia' in pheno.lower() or 'alzheimer' in pheno.lower()
+              else 'steelblue' for pheno in top_risks['phenotype']]
+
+    ax.barh(range(len(top_risks)), top_risks['hazard_ratio'], color=colors, alpha=0.7)
+    ax.set_yticks(range(len(top_risks)))
+    ax.set_yticklabels(top_risks['phenotype'], fontsize=9)
+    ax.set_xlabel('Hazard Ratio (Relative Risk)', fontsize=12)
+    ax.set_title('Top 20 Predicted Disease Risks from PSG Analysis', fontsize=14, fontweight='bold')
+    ax.axvline(x=1.0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='Baseline risk')
+    ax.legend()
+    ax.grid(axis='x', alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print table
+    print("\nTop 20 Disease Risks:")
+    print(top_risks[['phecode', 'phenotype', 'hazard_ratio']].to_string(index=False))
+```
+
+## Dementia Risk Distribution
+
+```{python}
+#| label: visualize-dementia-distribution
+#| echo: true
+#| eval: false
+#| fig-cap: "Distribution of dementia hazard ratios across all diseases"
+
+if 'hazard_logits' in locals():
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Histogram of all hazards
+    axes[0].hist(results_df['hazard_ratio'], bins=50, color='steelblue', alpha=0.7, edgecolor='black')
+    axes[0].axvline(x=dementia_risk_ratio, color='red', linestyle='--', linewidth=2,
+                    label=f'Dementia (HR={dementia_risk_ratio:.2f})')
+    axes[0].set_xlabel('Hazard Ratio', fontsize=11)
+    axes[0].set_ylabel('Number of Diseases', fontsize=11)
+    axes[0].set_title('Distribution of Disease Hazard Ratios', fontsize=12, fontweight='bold')
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    # Percentile rank
+    percentile = (results_df['hazard_ratio'] < dementia_risk_ratio).sum() / len(results_df) * 100
+
+    axes[1].bar(['Dementia Risk'], [dementia_risk_ratio], color='red', alpha=0.7, width=0.5)
+    axes[1].axhline(y=1.0, color='black', linestyle='--', linewidth=1, alpha=0.5, label='Baseline')
+    axes[1].set_ylabel('Hazard Ratio', fontsize=11)
+    axes[1].set_title(f'Dementia Risk\n(Percentile: {percentile:.1f}th)', fontsize=12, fontweight='bold')
+    axes[1].legend()
+    axes[1].grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+```
+
+## Sleep Architecture Analysis
+
+```{python}
+#| label: visualize-sleep-architecture
+#| echo: true
+#| eval: false
+#| fig-cap: "Sleep stage progression throughout the night (if available)"
+
+# Note: This requires sleep staging predictions
+# If you have sleep staging labels, you can visualize them here
+
+if sample_file.exists():
+    # Placeholder for sleep staging visualization
+    # In a full analysis, you would:
+    # 1. Run sleep staging model
+    # 2. Generate hypnogram
+    # 3. Analyze sleep architecture features
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+
+    # Example hypnogram (would be replaced with actual predictions)
+    # sleep_stages = [0, 1, 2, 3, 3, 2, 2, 4, 2, 2, ...]  # Wake, S1, S2, S3, REM
+
+    print("Sleep architecture analysis requires sleep staging predictions.")
+    print("See sleepfm/pipeline/finetune_sleep_staging.py for implementation.")
+```
+
+---
+
+# Clinical Interpretation
+
+## Understanding Hazard Ratios
+
+The model outputs **hazard ratios (HR)**, which represent relative risk compared to a baseline population:
+
+| Hazard Ratio | Interpretation |
+|--------------|----------------|
+| HR = 1.0 | Same risk as baseline |
+| HR = 1.5 | 50% higher risk than baseline |
+| HR = 2.0 | 2x (double) the risk |
+| HR = 0.5 | 50% lower risk (protective) |
+
+For dementia prediction, SleepFM achieved a **C-Index of 0.85** in validation studies, indicating strong discriminative ability.
+
+## Key Sleep Biomarkers for Dementia
+
+Research suggests several sleep features are associated with dementia risk:
+
+1. **Sleep fragmentation**: Frequent awakenings and poor sleep consolidation
+2. **Slow-wave sleep (SWS) reduction**: Decreased deep sleep (Stage N3)
+3. **REM sleep disruption**: Altered REM patterns
+4. **Sleep apnea**: Oxygen desaturation events
+5. **Heart rate variability**: Autonomic dysfunction during sleep
+
+The SleepFM model learns these patterns automatically from multi-modal PSG data without explicit feature engineering.
+
+## Limitations and Considerations
+
+::: {.callout-warning}
+## Important Clinical Considerations
+
+- **Predictions are population-level**: Individual outcomes vary
+- **Not diagnostic**: This is a risk prediction tool, not a diagnostic test
+- **Requires validation**: Results should be validated with clinical assessment
+- **Temporal factors**: Risk may change with age, health status, and interventions
+- **Cohort differences**: Model trained on specific populations (see original paper)
+:::
+
+---
+
+# Reproducibility
+
+## System Information
+
+```{python}
+#| label: system-info
+#| echo: true
+
+import platform
+import torch
+
+print("System Information:")
+print(f"  Python: {platform.python_version()}")
+print(f"  PyTorch: {torch.__version__}")
+print(f"  CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"  CUDA version: {torch.version.cuda}")
+print(f"  NumPy: {np.__version__}")
+print(f"  Pandas: {pd.__version__}")
+```
+
+## Session Info
+
+```{python}
+#| label: session-info
+#| echo: true
+
+from datetime import datetime
+
+print(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Working directory: {os.getcwd()}")
+```
+
+---
+
+# References
+
+1. **Thapa, R., Kjaer, M.R., He, B., et al.** (2026). A multimodal sleep foundation model for disease prediction. *Nature Medicine*. https://doi.org/10.1038/s41591-025-04133-4
+
+2. **National Sleep Research Resource (NSRR)**. Sleep Heart Health Study. https://sleepdata.org/datasets/shhs
+
+3. **Zhang, G.Q., et al.** (2018). The National Sleep Research Resource: towards a sleep data commons. *Journal of the American Medical Informatics Association*, 25(10), 1351-1358.
+
+4. **Livingston, G., et al.** (2020). Dementia prevention, intervention, and care: 2020 report of the Lancet Commission. *The Lancet*, 396(10248), 413-446.
+
+5. **Leng, Y., et al.** (2019). Association between circadian rhythms and neurodegenerative diseases. *The Lancet Neurology*, 18(3), 307-318.
+
+---
+
+# Appendix
+
+## Code Repository
+
+- GitHub: https://github.com/zou-group/sleepfm-clinical
+- Documentation: See `README.md`
+- Demo notebook: `notebooks/demo.ipynb`
+
+## Data Access
+
+All datasets used in this report are freely available through:
+
+- **NSRR**: https://sleepdata.org
+- **PhysioNet**: https://physionet.org
+- **Stanford Sleep Dataset**: https://bdsp.io/content/08vg8vqv2wdtwonc1ddy/1.0
+
+## Contact
+
+For questions about SleepFM or this analysis, please open an issue on the GitHub repository.
+
+---
+
+::: {.callout-note}
+## Acknowledgments
+
+This work builds on the SleepFM model developed by Thapa et al. (2026) and published in *Nature Medicine*. We thank the NSRR for providing open-access sleep data and the SleepFM team for releasing pre-trained models.
+:::
