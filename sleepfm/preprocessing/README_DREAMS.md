@@ -2,6 +2,8 @@
 
 This directory contains scripts to download and preprocess the **DREAMS (Database for REcording and Analysis of Multiple Sleep) dataset** from Zenodo for use with SleepFM.
 
+The download script uses **zenodo_get**, a dedicated Python package for downloading Zenodo datasets, providing robust downloading with MD5 verification, retry logic, and resume capability.
+
 ## About the DREAMS Dataset
 
 The DREAMS dataset ([Zenodo Record 2650142](https://zenodo.org/records/2650142)) contains polysomnographic (PSG) recordings collected during the DREAMS project funded by Région Wallonne (Belgium).
@@ -26,6 +28,32 @@ The DREAMS dataset ([Zenodo Record 2650142](https://zenodo.org/records/2650142))
 - Format: European Data Format (EDF)
 - Acquisition: Digital 32-channel polygraph (Brainnet™ System, MEDATEC, Brussels)
 - Source: Sleep laboratory of a Belgian hospital
+
+## Prerequisites
+
+### Install zenodo-get
+
+The download script requires `zenodo-get`, a robust tool for downloading Zenodo datasets:
+
+```bash
+pip install zenodo-get
+```
+
+Or install all requirements:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Why zenodo-get?
+
+We use `zenodo-get` instead of manual API calls because it provides:
+- **MD5 verification**: Automatically verifies file integrity after download
+- **Resume capability**: Can resume interrupted downloads
+- **Retry logic**: Automatically retries failed downloads
+- **Progress tracking**: Built-in progress bars for large downloads
+- **Robust error handling**: Continues downloading other files if one fails
+- **Community tested**: Widely used in the scientific community
 
 ## Quick Start
 
@@ -141,13 +169,22 @@ data/dreams/
 
 ### download_zenodo_data.py
 
-Downloads datasets from Zenodo using their API.
+Downloads datasets from Zenodo using the `zenodo_get` package.
 
 **Arguments:**
 - `--record_id`: Zenodo record ID (default: 2650142)
 - `--output_dir`: Output directory for downloaded files (required)
 - `--patterns`: File patterns to download (e.g., `*.edf *.txt`)
 - `--list_only`: List files without downloading
+- `--no_verify_md5`: Skip MD5 checksum verification (faster but less safe)
+- `--stop_on_error`: Stop if any file fails (default: continue on error)
+
+**Features:**
+- Automatic MD5 verification for data integrity
+- Resume capability for interrupted downloads
+- Parallel downloading where possible
+- Detailed progress tracking
+- Metadata saving for record information
 
 ### process_dreams_data.py
 
@@ -175,14 +212,20 @@ All-in-one wrapper script that runs the complete pipeline.
 
 ## Requirements
 
-The scripts use the following Python packages (already in requirements.txt):
-- requests
-- tqdm
-- loguru
-- h5py
-- numpy
-- pandas
-- pyedflib or mne
+The scripts use the following Python packages (included in requirements.txt):
+- **zenodo-get** (>=2.0.0) - For downloading Zenodo datasets
+- requests (>=2.31.0) - For API metadata fetching
+- tqdm - Progress bars
+- loguru - Logging
+- h5py - HDF5 file operations
+- numpy - Numerical operations
+- pandas - Data manipulation
+- pyedflib or mne - EDF file reading
+
+Install all requirements:
+```bash
+pip install -r requirements.txt
+```
 
 ## Citation
 
@@ -199,13 +242,26 @@ The DREAMS dataset is licensed under **Creative Commons Attribution Non Commerci
 
 ## Troubleshooting
 
-### Download fails with 403 error
+### zenodo_get not found
 
-If direct download fails, you can manually download from the Zenodo web interface:
-1. Visit: https://zenodo.org/records/2650142
-2. Download files manually
-3. Place them in the raw data directory
-4. Run the processing scripts
+If you get an error that `zenodo_get` is not installed:
+```bash
+pip install zenodo-get
+# or
+python -m pip install zenodo-get
+```
+
+### Download fails with network errors
+
+`zenodo_get` has built-in retry logic, but if downloads continue to fail:
+1. Check your internet connection
+2. Try downloading without MD5 verification: `--no_verify_md5`
+3. Use the `--stop_on_error` flag to identify problematic files
+4. As a fallback, manually download from: https://zenodo.org/records/2650142
+
+### Interrupted downloads
+
+`zenodo_get` supports resume capability. Simply run the same command again, and it will skip already downloaded files and resume incomplete ones.
 
 ### Conversion errors
 
